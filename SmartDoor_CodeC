@@ -1,0 +1,107 @@
+#include "stm32f4xx.h"
+
+// Common Cathode Bitmasks
+#define CHAR_H  0x76
+#define CHAR_F  0x71
+#define CHAR_1  0x06
+
+// Track button hold state using interrupt
+static volatile uint8_t button_pressed = 0;
+
+// --- helper subroutines (still fine for “subroutine” requirement) ---
+static inline void buzzer_on(void)  { GPIOD->ODR |=  (1U << 2); }
+static inline void buzzer_off(void) { GPIOD->ODR &= ~(1U << 2); }
+
+static inline void leds_on(void)    { GPIOB->ODR |=  (0xFU << 12); }
+static inline void leds_off(void)   { GPIOB->ODR &= ~(0xFU << 12); }
+
+static inline void display_F1(void) { GPIOC->ODR = (CHAR_F << 0) | (CHAR_1 << 8); }
+static inline void display_H1(void) { GPIOC->ODR = (CHAR_H << 0) | (CHAR_1 << 8); }
+static inline void display_off(void){ GPIOC->ODR = 0; }
+
+// --- Interrupt setup for SW4 = PB1 (EXTI1) ---
+static void exti_button_init_pb1(void)
+{
+    // Enable SYSCFG clock for EXTI mapping
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+    // Map EXTI1 to PB1 (EXTICR1 bits [7:4] = 0001 for Port B)
+    SYSCFG->EXTICR[0] &= ~(0xFU << 4);
+    SYSCFG->EXTICR[0] |=  (0x1U << 4);
+
+    // Unmask EXTI1
+    EXTI->IMR |= (1U << 1);
+
+    // Trigger on BOTH edges: falling (press) + rising (release)
+    EXTI->FTSR |= (1U << 1);
+    EXTI->RTSR |= (1U << 1);
+
+    // Clear pending
+    EXTI->PR = (1U << 1);
+
+    // Enable NVIC interrupt
+    NVIC_EnableIRQ(EXTI1_IRQn);
+}
+
+void EXTI1_IRQHandler(void)
+{
+    if (EXTI->PR & (1U << 1)) {
+        EXTI->PR = (1U << 1);  // clear pending
+
+        // SW4 PB1 is LOW when pressed (because pull-up)
+        if ((GPIOB->IDR & (1U << 1)) == 0) button_pressed = 1;
+        else                               button_pressed = 0;
+    }
+}
+
+int main(void)
+{
+    // 1. Enable Clocks
+    RCC->AHB1ENR |= (RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIOBEN |
+                     RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIODEN);
+
+    // 2. Configure Outputs
+    GPIOC->MODER |= 0x55555555;      // PC0-PC15 as output (7-seg)
+    GPIOB->MODER &= ~(0xFF000000);   // reset PB12-15
+    GPIOB->MODER |=  (0x55000000);   // PB12-15 as output (LEDs)
+
+    GPIOD->MODER &= ~(3U << (2 * 2));
+    GPIOD->MODER |=  (1U << (2 * 2)); // PD2 as output (buzzer)
+
+    // 3. Configure Inputs (PA0=Smoke, PA1=Motion, PB1=SW4 Button)
+    GPIOA->MODER &= ~((3U << 0) | (3U << 2));  // PA0, PA1 input
+    GPIOA->PUPDR &= ~((3U << 0) | (3U << 2));
+    GPIOA->PUPDR |=  ((1U << 0) | (1U << 2));  // pull-up PA0, PA1
+
+    GPIOB->MODER &= ~(3U << (1 * 2));         // PB1 input
+    GPIOB->PUPDR &= ~(3U << (1 * 2));
+    GPIOB->PUPDR |=  (1U << (1 * 2));         // pull-up PB1
+
+    // 4. Init EXTI interrupt for SW4 PB1
+    exti_button_init_pb1();
+
+    while (1) {
+        // Read sensors (0 = triggered)
+        int smoke  = !(GPIOA->IDR & (1U << 0));
+        int motion = !(GPIOA->IDR & (1U << 1));
+
+        // --- BUZZER CONTROL ---
+        // Same intention: buzzer if smoke OR button pressed
+        if (smoke || button_pressed) buzzer_on();
+        else                         buzzer_off();
+
+        // --- DISPLAY & LED CONTROL ---
+        if (smoke) {
+            display_F1();   // smoke overrides motion
+            leds_on();
+        }
+        else if (motion) {
+            display_H1();
+            leds_on();
+        }
+        else {
+            display_off();
+            leds_off();
+        }
+    }
+}
